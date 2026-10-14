@@ -77,6 +77,7 @@ python3 tf_flasher.py armbian --image Armbian.img.xz --dtb rk-kernel.dtb
 동작: `check backup patch flash restore all dtb armbian`. 전체 옵션은 `-h`.
 스크립트/CI: `--non-interactive` 붙이면 질문 안 함. 플래시/복구/전체/Armbian은 `-y`도 같이 줘야 하고 없으면 종료코드 2.
 종료코드: 0 성공, 1 실패/취소, 2 `--non-interactive`인데 `-y` 없음.
+AI 에이전트용 사용법: [AGENTS.md](AGENTS.md).
 
 **1/1.5세대**
 1. 리셋 버튼 누른 채 데이터 되는 5핀 케이블로 전원 연결 → Loader 모드.
