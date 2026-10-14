@@ -25,7 +25,14 @@ pip3 install -r requirements.txt && pip3 install .
 firehose 로더(`prog_*.elf`/`.mbn`)는 기기에 맞는 걸 직접 구해야 함. 비워두면 edl 내장 로더 자동탐색.
 
 ### Windows
-**자동 설치** (PowerShell):
+**한 줄 설치+실행** (PowerShell에 붙여넣기):
+```powershell
+irm https://raw.githubusercontent.com/HITEYY/TF-Flasher/master/get.ps1 | iex
+```
+`$HOME\TF-Flasher`에 받아서 설치 후 GUI 실행. 다시 실행하면 업데이트+실행 (`backup\`, `tools\` 유지).
+2세대: 먼저 `$env:TF_EDL=1`. 설치 위치 변경: `$env:TF_DIR='D:\TF-Flasher'`.
+
+**자동 설치** (받은 폴더에서):
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1        # 1/1.5세대
 powershell -ExecutionPolicy Bypass -File install.ps1 -Edl   # 2세대 edl까지

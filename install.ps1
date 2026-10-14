@@ -1,10 +1,12 @@
 ﻿# TF-Flasher Windows 설치 스크립트
-# 실행: powershell -ExecutionPolicy Bypass -File install.ps1 [-Edl] [-Rebuild] [-SkipZadig]
+# 한 줄 설치: irm https://raw.githubusercontent.com/HITEYY/TF-Flasher/master/get.ps1 | iex
+# 실행: powershell -ExecutionPolicy Bypass -File install.ps1 [-Edl] [-Rebuild] [-SkipZadig] [-NoLaunch]
 #   -Edl       2세대(Qualcomm EDL)용 edl도 설치
 #   -Rebuild   tools\rkdeveloptool.exe 있어도 다시 빌드
 #   -SkipZadig Zadig(USB 드라이버) 받기/실행 생략
+#   -NoLaunch  끝나고 TF-Flasher 실행 안 함
 # 하는 일: Python 3 / MSYS2 설치(winget) -> rkdeveloptool 빌드 -> tools\ 에 exe+DLL -> (edl) -> Zadig
-param([switch]$Edl, [switch]$Rebuild, [switch]$SkipZadig)
+param([switch]$Edl, [switch]$Rebuild, [switch]$SkipZadig, [switch]$NoLaunch)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -126,4 +128,8 @@ if (-not $SkipZadig) {
 }
 
 Step '완료'
-Write-Host "실행: cd `"$root`"; py tf_flasher.py"
+Write-Host "다음부터 실행: cd `"$root`"; py tf_flasher.py  (또는 한 줄 설치 명령 다시 실행 = 업데이트+실행)"
+if (-not $NoLaunch) {
+    Set-Location $root
+    py -3 (Join-Path $root 'tf_flasher.py')
+}
