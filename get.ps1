@@ -15,6 +15,9 @@
     Invoke-WebRequest 'https://github.com/HITEYY/TF-Flasher/archive/refs/heads/master.zip' -OutFile $zip
     if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
     Expand-Archive $zip $tmp
+    if (-not (Test-Path (Join-Path $tmp 'TF-Flasher-master\install.ps1'))) {
+        throw 'Downloaded archive has no install.ps1 (GitHub cache right after a push?). Retry in a minute.'
+    }
     New-Item -ItemType Directory -Force $dir | Out-Null
     Copy-Item -Recurse -Force (Join-Path $tmp 'TF-Flasher-master\*') $dir
     Remove-Item -Recurse -Force $tmp, $zip
