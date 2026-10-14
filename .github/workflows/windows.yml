@@ -1,0 +1,36 @@
+# Windows 배포본: TF-Flasher + tools/rkdeveloptool.exe(+DLL). Actions 탭에서 수동 실행하거나 v* 태그 푸시.
+name: windows
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            git autoconf automake make
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-libusb mingw-w64-x86_64-pkgconf
+      - name: rkdeveloptool 빌드
+        run: |
+          git clone --depth 1 https://github.com/rockchip-linux/rkdeveloptool rk
+          cd rk
+          autoreconf -i && ./configure && make CXXFLAGS="-O2 -Wno-error"
+          mkdir -p ../dist/tools
+          cp rkdeveloptool.exe ../dist/tools/
+          ldd rkdeveloptool.exe | awk '$3 ~ /mingw64/ {print $3}' | xargs -r cp -t ../dist/tools/
+          ../dist/tools/rkdeveloptool.exe -v
+      - name: 패키징
+        run: cp tf_flasher.py README.md dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TF-Flasher-windows
+          path: dist

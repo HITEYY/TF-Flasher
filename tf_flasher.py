@@ -5,6 +5,7 @@
 절차: 장치 확인 -> 전 파티션 백업 -> super 내 system에서 APK 삭제 -> super 플래시
 필요: 1/1.5세대 rkdeveloptool, 2세대 edl(bkerler/edl) + firehose 로더, 공통 e2fsprogs(debugfs)
 """
+import lzma
 import os
 import queue
 import re
@@ -19,6 +20,8 @@ BACKUP = ROOT / "backup"
 WORK = ROOT / "work"
 TABLE = BACKUP / "partitions.txt"
 FLASH = WORK / "flash"
+TOOLS = ROOT / "tools"  # rkdeveloptool(.exe) 등을 여기 두면 PATH 없이 사용 (Windows용)
+DTB_OUT = WORK / "dtb"
 
 TOSS_APKS = [
     "/system/app/TossPlace/TossPlace.apk",
@@ -37,10 +40,14 @@ class Fail(Exception):
 # ---------- 외부 도구 ----------
 
 def run(cmd, quiet=False):
+    cmd = list(map(str, cmd))
+    cmd[0] = shutil.which(cmd[0], path=f"{TOOLS}{os.pathsep}{os.environ.get('PATH', '')}") or cmd[0]
     if not quiet:
-        log("$ " + " ".join(map(str, cmd)))
+        log("$ " + " ".join(cmd))
     try:
-        p = subprocess.run(list(map(str, cmd)), capture_output=True, text=True)
+        # Windows: 한글 로케일(cp949) 대신 utf-8, GUI에서 콘솔창 안 뜨게
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except FileNotFoundError:
         raise Fail(f"{cmd[0]} 를 찾을 수 없음. README의 설치 방법 참고.")
     out = (p.stdout + p.stderr).strip()
@@ -56,14 +63,16 @@ def rk(*args):
     return out
 
 
-def find_debugfs():
-    for p in [shutil.which("debugfs"),
+def find_debugfs(required=True):
+    for p in [shutil.which("debugfs", path=f"{TOOLS}{os.pathsep}{os.environ.get('PATH', '')}"),
               "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
               "/usr/local/opt/e2fsprogs/sbin/debugfs",
               "/sbin/debugfs", "/usr/sbin/debugfs"]:
         if p and os.path.exists(p):
             return p
-    raise Fail("debugfs 없음. macOS: brew install e2fsprogs / Linux: apt install e2fsprogs")
+    if required:
+        raise Fail("debugfs 없음. macOS: brew install e2fsprogs / Linux: apt install e2fsprogs / "
+                   "Windows: WSL에서 실행")
 
 
 # ---------- 1. 장치 확인 ----------
@@ -252,15 +261,111 @@ def erofs_hide(img, path):
     return True
 
 
+# debugfs 없을 때(Windows) ext4도 EROFS처럼 *.apk -> *.ap~ 제자리 이름변경.
+# metadata_csum 이면 디렉터리 블록 체크섬(crc32c) 재계산.
+CRC32C = []
+for _n in range(256):
+    for _ in range(8):
+        _n = (_n >> 1) ^ (0x82F63B78 if _n & 1 else 0)
+    CRC32C.append(_n)
+
+
+def crc32c(crc, data):
+    for b in data:
+        crc = CRC32C[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc
+
+
+def ext4_hide(img, path):
+    with open(img, "r+b") as f:
+        def rd(off, n):
+            f.seek(off)
+            return f.read(n)
+
+        sb = rd(1024, 1024)
+        bs = 1024 << struct.unpack_from("<I", sb, 0x18)[0]
+        first, = struct.unpack_from("<I", sb, 0x14)
+        ipg, = struct.unpack_from("<I", sb, 0x28)
+        isz, = struct.unpack_from("<H", sb, 0x58)
+        incompat, ro = struct.unpack_from("<II", sb, 0x60)
+        dsz = struct.unpack_from("<H", sb, 0xFE)[0] if incompat & 0x80 else 32
+        csum = ro & 0x400
+        seed = struct.unpack_from("<I", sb, 0x270)[0] if incompat & 0x2000 else \
+            crc32c(0xFFFFFFFF, sb[0x68:0x78])
+
+        def inode(n):
+            g, i = divmod(n - 1, ipg)
+            gd = rd((first + 1) * bs + g * dsz, dsz)
+            tbl = struct.unpack_from("<I", gd, 8)[0]
+            if dsz >= 64:
+                tbl |= struct.unpack_from("<I", gd, 0x28)[0] << 32
+            return rd(tbl * bs + i * isz, isz)
+
+        def blocks(ino):
+            flags, = struct.unpack_from("<I", ino, 0x20)
+            if flags & 0x10000000 or not flags & 0x80000:
+                raise Fail("ext4 디렉터리 형식 미지원 (inline/blockmap) - debugfs 필요")
+            out = []
+
+            def walk(node):
+                magic, n, _max, depth = struct.unpack_from("<4H", node, 0)
+                if magic != 0xF30A:
+                    raise Fail("ext4 extent 헤더 이상")
+                for k in range(12, 12 + n * 12, 12):
+                    if depth:
+                        lo, hi = struct.unpack_from("<IH", node, k + 4)
+                        walk(rd((hi << 32 | lo) * bs, bs))
+                    else:
+                        _l, ln, hi, lo = struct.unpack_from("<IHHI", node, k)
+                        out.extend(range(hi << 32 | lo, (hi << 32 | lo) + (ln & 0x7FFF)))
+            walk(ino[0x28:0x28 + 60])
+            return out
+
+        def entries(n):
+            ino = inode(n)
+            for blk in blocks(ino):
+                data, p = rd(blk * bs, bs), 0
+                while p + 8 <= bs:
+                    child, rl, nl = struct.unpack_from("<IHB", data, p)
+                    if rl < 8:
+                        break
+                    if child and nl:
+                        yield child, data[p + 8:p + 8 + nl], blk, p + 8 + nl - 1, ino
+                    p += rl
+
+        nid, parts = 2, path.strip("/").encode().split(b"/")
+        for comp in parts[:-1]:
+            nid = next((c for c, nm, *_ in entries(nid) if nm == comp), None)
+            if nid is None:
+                return False
+        hit = next((e for e in entries(nid) if e[1] == parts[-1]), None)
+        if not hit:
+            return False
+        _, _, blk, last, dino = hit
+        if struct.unpack_from("<I", dino, 0x20)[0] & 0x1000:
+            raise Fail(f"{path}: htree 디렉터리 - debugfs 필요")
+        data = bytearray(rd(blk * bs, bs))
+        data[last] = ord("~")
+        if csum:
+            if data[bs - 12:bs - 4] != b"\0\0\0\0\x0c\0\0\xde":
+                raise Fail("ext4 디렉터리 체크섬 tail 없음")
+            c = crc32c(crc32c(crc32c(seed, struct.pack("<I", nid)), dino[0x64:0x68]), data[:bs - 12])
+            struct.pack_into("<I", data, bs - 4, c)
+        f.seek(blk * bs)
+        f.write(data)
+    return True
+
+
 def strip_apks(sysimg):
     fs = fs_type(sysimg)
-    log(f"system 파일시스템: {fs}")
+    debugfs = fs == "erofs" or find_debugfs(required=False)
+    log(f"system 파일시스템: {fs}" + ("" if debugfs else " (debugfs 없음 -> 이름변경 방식)"))
     removed = 0
     for apk in TOSS_APKS:
         # system-as-root 이미지면 /system/..., 아니면 / 기준
         for path in (apk, apk[len("/system"):]):
             ok = erofs_hide(sysimg, path) if fs == "erofs" else \
-                ext4_remove(sysimg, path, fs == "ext4-shared")
+                ext4_remove(sysimg, path, fs == "ext4-shared") if debugfs else ext4_hide(sysimg, path)
             if ok:
                 log(f"제거됨: {path}")
                 removed += 1
@@ -352,9 +457,19 @@ def flash():
     log("완료. 부팅 후 설정 -> 공장초기화 하세요.")
 
 
+def current_parts():
+    """기기 GPT. Armbian 등으로 덮여 없으면 []"""
+    code, out = run(["rkdeveloptool", "ppt"], quiet=True)
+    return parse_ppt(out) if code == 0 else []
+
+
 def restore():
+    # GPT가 없어졌으면(Armbian 설치 후) _head(GPT+로더 영역)도 되돌림
+    head = not any(n == "super" for n, _ in current_parts())
+    if head:
+        log("기기에 Android 파티션 테이블 없음 -> _head도 복구")
     for name, start, count in read_table():
-        if name.startswith("_"):
+        if name.startswith("_") and not head:
             continue
         img = BACKUP / f"{name}.img"
         if img.stat().st_size != count * 512:
@@ -363,6 +478,195 @@ def restore():
         rk("wl", start, img)
     rk("rd")
     log("복구 완료")
+
+
+# ---------- Armbian (1/1.5세대) ----------
+# Armbian 이미지는 LBA 0부터 eMMC에 통째로 씀 (idbloader@64, u-boot@16384, rootfs).
+# 토스 프론트용 이미지는 없음 -> 다른 RK3399 보드 이미지 + 기기용 DTB를 지정해서 씀.
+# 안 뜨면 BOOT-GND 쇼트로 MaskROM 진입 후 복구 (bootrom이라 항상 가능).
+
+ARMBIAN = WORK / "armbian.img"
+
+
+def disk_parts(img):
+    """MBR/GPT 디스크 이미지 -> [파티션 시작 byte offset]"""
+    with open(img, "rb") as f:
+        mbr = f.read(512)
+        if mbr[510:] != b"\x55\xaa":
+            raise Fail("파티션 테이블 없음 (Armbian .img 맞나?)")
+        ents = [struct.unpack_from("<B3xB3xII", mbr, 446 + i * 16) for i in range(4)]
+        if ents[0][1] != 0xEE:
+            return [lba * 512 for _, t, lba, n in ents if t and n]
+        f.seek(512)
+        hdr = f.read(92)
+        if hdr[:8] != b"EFI PART":
+            raise Fail("GPT 헤더 이상")
+        ent_lba, n, sz = struct.unpack_from("<QII", hdr, 72)
+        f.seek(ent_lba * 512)
+        raw = f.read(n * sz)
+    return [struct.unpack_from("<Q", raw, i * sz + 32)[0] * 512
+            for i in range(n) if raw[i * sz:i * sz + 16].strip(b"\0")]
+
+
+def armbian_set_dtb(img, dtb):
+    """rootfs(또는 /boot 파티션)에 dtb 넣고 armbianEnv.txt fdtfile 교체"""
+    debugfs = find_debugfs()
+    name = re.sub(r"[^\w.-]", "_", Path(dtb).name)
+    local_dtb, env = WORK / name, WORK / "armbianEnv.txt"
+    shutil.copyfile(dtb, local_dtb)
+    for off in disk_parts(img):
+        dev = f"{img}?offset={off}"
+        for boot in ("/boot", ""):  # /boot가 별도 파티션이면 그 루트에 있음
+            env.unlink(missing_ok=True)
+            run([debugfs, "-R", f'dump {boot}/armbianEnv.txt "{env}"', dev], quiet=True)
+            if env.exists():
+                break
+        else:
+            continue
+        lines = [l for l in env.read_text().splitlines() if not l.startswith("fdtfile=")]
+        env.write_text("\n".join(lines + [f"fdtfile=rockchip/{name}"]) + "\n")
+        cmds = WORK / "debugfs.cmd"
+        cmds.write_text(f'cd {boot}/dtb/rockchip\nrm {name}\nwrite "{local_dtb}" {name}\n'
+                        f'cd {boot or "/"}\nrm armbianEnv.txt\nwrite "{env}" armbianEnv.txt\n')
+        run([debugfs, "-w", "-f", cmds, dev], quiet=True)
+        out = run([debugfs, "-R", f"stat {boot}/dtb/rockchip/{name}", dev], quiet=True)[1]
+        if "Inode:" not in out:
+            raise Fail("DTB 쓰기 실패 (dtb/rockchip 디렉터리 없음?)")
+        log(f"DTB 적용: fdtfile=rockchip/{name}")
+        return
+    raise Fail("이미지에서 armbianEnv.txt 못 찾음 (Armbian 이미지 맞나?)")
+
+
+def prepare_armbian(src, dtb=None):
+    src = Path(src)
+    WORK.mkdir(exist_ok=True)
+    log(f"{src.name} 준비 중...")
+    with (lzma.open(src) if src.suffix == ".xz" else open(src, "rb")) as i, open(ARMBIAN, "wb") as o:
+        shutil.copyfileobj(i, o, 1 << 20)
+    size = ARMBIAN.stat().st_size
+    if size % 512:
+        os.truncate(ARMBIAN, size + 512 - size % 512)
+    disk_parts(ARMBIAN)
+    if dtb:
+        armbian_set_dtb(ARMBIAN, dtb)
+    else:
+        log("경고: DTB 미지정 - 이미지 원래 보드 DTB로 부팅 (화면/터치 안 될 가능성 큼)")
+    return ARMBIAN
+
+
+def armbian_install(src, dtb=None):
+    if not src:
+        raise Fail("Armbian 이미지(.img/.img.xz) 선택 필요")
+    table = read_table()
+    names = {n for n, _, _ in table}
+    if not {"_head", "super"} <= names:
+        raise Fail("백업이 불완전함 (_head/super 없음). 백업 먼저")
+    starts = {n: s for n, s, _ in table}
+    for n, s in current_parts():
+        if starts.get(n, s) != s:
+            raise Fail(f"백업이 이 기기 것이 아님 ({n} 위치 다름)")
+    img = prepare_armbian(src, dtb)
+    if img.stat().st_size > flash_sectors() * 512:
+        raise Fail("이미지가 eMMC보다 큼")
+    log("Armbian 쓰는 중... (Android 전부 지워짐, 케이블 건드리지 말 것)")
+    rk("wl", 0, img)
+    rk("rd")
+    log("완료. 안 뜨면 BOOT-GND 쇼트로 MaskROM 진입 후 [복구].")
+
+
+# ---------- DTB 추출 ----------
+# Rockchip Android는 DTB를 resource.img(RSCE, rk-kernel.dtb)나 boot.img(second/dtb 섹션)에 둠.
+# vendor 4.4 커널용이라 메인라인 Armbian에 그대로는 안 맞음 -> 기기용 DTS 만들 때 참고용.
+
+FDT_MAGIC = b"\xd0\x0d\xfe\xed"
+
+
+def rsce_entries(data):
+    """resource.img(RSCE) -> {byte_off: 이름}"""
+    if data[:4] != b"RSCE":
+        return {}
+    _hsz, tbl, esz, n = struct.unpack_from("<BBBI", data, 8)
+    out = {}
+    for i in range(n):
+        e = (tbl + i * esz) * 512
+        if data[e:e + 4] != b"ENTR":
+            break
+        off, = struct.unpack_from("<I", data, e + 260)
+        out[off * 512] = data[e + 4:e + 260].split(b"\0")[0].decode(errors="replace")
+    return out
+
+
+def fdt_root_props(blob):
+    """루트 노드 문자열 속성 (model, compatible)"""
+    _m, _sz, st, strs = struct.unpack_from(">4I", blob, 0)
+    pos, props = st, {}
+    tok, = struct.unpack_from(">I", blob, pos)
+    if tok != 1:
+        return props
+    pos = (blob.index(b"\0", pos + 4) + 4) & ~3
+    while True:
+        tok, = struct.unpack_from(">I", blob, pos)
+        if tok == 4:
+            pos += 4
+            continue
+        if tok != 3:
+            return props
+        ln, noff = struct.unpack_from(">II", blob, pos + 4)
+        name = blob[strs + noff:blob.index(b"\0", strs + noff)].decode()
+        val = blob[pos + 12:pos + 12 + ln]
+        if name in ("model", "compatible"):
+            props[name] = ", ".join(v.decode(errors="replace") for v in val.split(b"\0") if v)
+        pos = (pos + 12 + ln + 3) & ~3
+
+
+def find_dtbs(data):
+    """바이너리에서 FDT 블롭 찾기 -> [(off, blob)] (DTBO 오버레이 제외)"""
+    out, i = [], data.find(FDT_MAGIC)
+    while i >= 0:
+        size, st, strs, rsv, ver, comp = struct.unpack_from(">6I", data, i + 4)
+        if 0x40 <= size <= 8 << 20 and max(st, strs, rsv) < size and 16 <= ver <= 17 \
+                and comp == 16 and i + size <= len(data):
+            blob = data[i:i + size]
+            if b"__fixups__" not in blob and b"fragment@" not in blob:
+                out.append((i, blob))
+                i = data.find(FDT_MAGIC, i + size)
+                continue
+        i = data.find(FDT_MAGIC, i + 4)
+    return out
+
+
+def extract_dtbs(src_dir=None, out_dir=None):
+    src_dir, out_dir = Path(src_dir or BACKUP), Path(out_dir or DTB_OUT)
+    kinds = ("resource", "boot", "vendor_boot", "recovery")  # resource 먼저: 엔트리 이름이 붙어 있음
+    kind = lambda f: next((i for i, k in enumerate(kinds)
+                           if f.stem == k or f.stem.startswith(k + "_")), None)
+    files = sorted((f for f in src_dir.glob("*") if f.suffix in (".img", ".bin") and kind(f) is not None),
+                   key=lambda f: (kind(f), f.name))
+    if not files:
+        raise Fail("백업에 resource/boot 이미지 없음. 백업 먼저")
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    dtc, seen = shutil.which("dtc"), set()
+    for f in files:
+        data = f.read_bytes()
+        names = rsce_entries(data)
+        for off, blob in find_dtbs(data):
+            if blob in seen:
+                continue
+            seen.add(blob)
+            name = re.sub(r"[^\w.-]", "_", names.get(off, "")) or f"{f.stem}_{off:x}.dtb"
+            dst = out_dir / (name if name.endswith(".dtb") else name + ".dtb")
+            dst.write_bytes(blob)
+            props = fdt_root_props(blob)
+            log(f"{dst.name} ({len(blob)} B, {f.name}@{off:#x}) "
+                f"model={props.get('model', '?')} compatible={props.get('compatible', '?')}")
+            if dtc:
+                run([dtc, "-q", "-I", "dtb", "-O", "dts", "-o", dst.with_suffix(".dts"), dst], quiet=True)
+    if not seen:
+        raise Fail("DTB 못 찾음 (압축된 커널에 붙어있을 수 있음)")
+    log(f"{len(seen)}개 추출 -> {out_dir}" + ("" if dtc else " (dts 변환은 brew install dtc)"))
+    log("주의: Android vendor 커널용. Armbian(메인라인)엔 그대로 안 맞을 수 있음 - DTS 작성 참고용")
+    return sorted(out_dir.glob("*.dtb"))
 
 
 # ---------- 2세대: Qualcomm EDL (bkerler/edl) ----------
@@ -444,6 +748,14 @@ def gui():
     tk.Button(row, text="찾기", command=lambda: loader.set(
         filedialog.askopenfilename() or loader.get())).pack(side="left")
     verity = tk.BooleanVar()
+    armbian, dtb = tk.StringVar(), tk.StringVar()
+    for label, var in (("Armbian 이미지:", armbian), ("DTB (선택):", dtb)):
+        r = tk.Frame(root)
+        r.pack(fill="x", padx=8)
+        tk.Label(r, text=label, width=14, anchor="w").pack(side="left")
+        tk.Entry(r, textvariable=var, width=40).pack(side="left", fill="x", expand=True)
+        tk.Button(r, text="찾기", command=lambda v=var: v.set(
+            filedialog.askopenfilename() or v.get())).pack(side="left")
     tk.Checkbutton(root, text="userdata도 백업 (느림)", variable=userdata).pack(anchor="w", padx=8)
     tk.Checkbutton(root, text="vbmeta verity 끄기 (부팅 안 될 때. 부트로더 언락 기기만 효과)",
                    variable=verity).pack(anchor="w", padx=8)
@@ -512,6 +824,12 @@ def gui():
             check_device(loader.get())
             restore()
 
+    def do_armbian():
+        if gen.get() == "edl":
+            raise Fail("Armbian은 1/1.5세대(RK3399)만")
+        check_device(loader.get())
+        armbian_install(armbian.get(), dtb.get())
+
     def do_patch():
         patch(verity_off=verity.get())
 
@@ -528,6 +846,9 @@ def gui():
         ("복구", do_restore, "백업 이미지로 전부 되돌립니다. 계속?"),
         ("전체 실행", everything,
          "백업 -> 패치 -> 플래시 순서로 진행합니다. 계속?"),
+        ("DTB 추출", extract_dtbs, None),
+        ("Armbian 설치", do_armbian,
+         "eMMC 전체를 Armbian으로 덮습니다 (Android 삭제). 백업 확인했나요? 계속?"),
     ]
     for text, fn, confirm in actions:
         b = tk.Button(btns, text=text, command=lambda f=fn, c=confirm: start(f, c))
