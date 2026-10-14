@@ -11,7 +11,8 @@ brew install e2fsprogs            # Linux: sudo apt install e2fsprogs
 # rkdeveloptool (brew에 없음 → 소스 빌드)
 brew install libusb automake autoconf pkg-config   # Linux: sudo apt install libusb-1.0-0-dev libudev-dev dh-autoreconf pkg-config
 git clone https://github.com/rockchip-linux/rkdeveloptool && cd rkdeveloptool
-autoreconf -i && ./configure && make && sudo cp rkdeveloptool /usr/local/bin/
+autoreconf -i && ./configure && make CXXFLAGS="-O2 -Wno-error" && sudo cp rkdeveloptool /usr/local/bin/
+# -Wno-error: 최신 clang에서 VLA 경고(-Wvla-cxx-extension)가 에러로 빌드 실패하는 것 회피
 ```
 Linux는 udev 규칙 없으면 `sudo`로 실행.
 
