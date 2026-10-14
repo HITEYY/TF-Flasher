@@ -788,14 +788,25 @@ def cli(argv):
     ap.add_argument("--image", default="", help="Armbian 이미지 (.img/.img.xz)")
     ap.add_argument("--dtb", default="", help="Armbian용 DTB (선택)")
     ap.add_argument("-y", "--yes", action="store_true", help="확인 질문 생략")
+    ap.add_argument("--non-interactive", action="store_true",
+                    help="질문 안 함. 확인 필요한 동작은 -y 없으면 종료코드 2")
     o = ap.parse_args(argv)
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)  # 파이프/CI에서도 로그 바로 출력
     _, fn, confirm = ACTIONS[o.action]
-    if confirm and not o.yes and input(f"{confirm} [y/N] ").strip().lower() != "y":
-        return 1
+    if confirm and not o.yes:
+        if o.non_interactive:
+            print(f"✘ --non-interactive: '{confirm}' 확인 필요 → -y 붙여서 실행", file=sys.stderr)
+            return 2
+        try:
+            if input(f"{confirm} [y/N] ").strip().lower() != "y":
+                return 1
+        except EOFError:  # stdin 없음 = 취소
+            return 1
     try:
         fn(o)
     except Fail as e:
-        print(f"✘ {e}")
+        print(f"✘ {e}", file=sys.stderr)
         return 1
     print("✔ 성공")
     return 0
