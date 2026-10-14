@@ -65,6 +65,17 @@ python3 tf_flasher.py
 ```
 상단에서 세대 선택.
 
+**CLI** (인자 주면 GUI 대신 CLI. 버튼과 같은 동작):
+```sh
+python3 tf_flasher.py check                         # 장치 확인
+python3 tf_flasher.py all                           # 백업 → 패치 → 플래시
+python3 tf_flasher.py backup --userdata --loader rk3399_loader.bin
+python3 tf_flasher.py patch --verity-off
+python3 tf_flasher.py flash --edl --loader prog.elf -y   # 2세대, 확인 생략
+python3 tf_flasher.py armbian --image Armbian.img.xz --dtb rk-kernel.dtb
+```
+동작: `check backup patch flash restore all dtb armbian`. 전체 옵션은 `-h`.
+
 **1/1.5세대**
 1. 리셋 버튼 누른 채 데이터 되는 5핀 케이블로 전원 연결 → Loader 모드.
    초기화 화면이 뜨는 기기면 케이스 열고 BOOT-GND 쇼트 후 연결 → MaskROM 모드 (이 때 `rk3399_loader_*.bin` 선택 필요).

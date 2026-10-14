@@ -710,9 +710,101 @@ def edl_restore(loader):
     log("복구 완료")
 
 
+# ---------- 동작 (GUI/CLI 공용) ----------
+# o: edl, loader, userdata, verity_off, image, dtb 속성을 가진 객체
+
+def do_check(o):
+    if o.edl:
+        edl_check(o.loader)
+    else:
+        check_device(o.loader)
+
+
+def do_backup(o):
+    if o.edl:
+        edl_backup(o.loader, o.userdata)
+    else:
+        check_device(o.loader)
+        backup(o.userdata)
+
+
+def do_patch(o):
+    patch(verity_off=o.verity_off)
+
+
+def do_flash(o):
+    if o.edl:
+        edl_flash(o.loader)
+    else:
+        check_device(o.loader)
+        flash()
+
+
+def do_restore(o):
+    if o.edl:
+        edl_restore(o.loader)
+    else:
+        check_device(o.loader)
+        restore()
+
+
+def do_all(o):
+    do_backup(o)
+    do_patch(o)
+    do_flash(o)
+
+
+def do_armbian(o):
+    if o.edl:
+        raise Fail("Armbian은 1/1.5세대(RK3399)만")
+    check_device(o.loader)
+    armbian_install(o.image, o.dtb)
+
+
+# CLI 이름: (버튼 이름, 함수, 확인 문구)
+ACTIONS = {
+    "check": ("장치 확인", do_check, None),
+    "backup": ("백업", do_backup, None),
+    "patch": ("패치", do_patch, None),
+    "flash": ("플래시", do_flash, "패치된 super를 기기에 씁니다. 계속?"),
+    "restore": ("복구", do_restore, "백업 이미지로 전부 되돌립니다. 계속?"),
+    "all": ("전체 실행", do_all, "백업 -> 패치 -> 플래시 순서로 진행합니다. 계속?"),
+    "dtb": ("DTB 추출", lambda o: extract_dtbs(), None),
+    "armbian": ("Armbian 설치", do_armbian,
+                "eMMC 전체를 Armbian으로 덮습니다 (Android 삭제). 백업 확인했나요? 계속?"),
+}
+
+
+# ---------- CLI ----------
+
+def cli(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="tf_flasher.py", description="인자 없이 실행하면 GUI")
+    ap.add_argument("action", choices=ACTIONS, help=", ".join(f"{k}={v[0]}" for k, v in ACTIONS.items()))
+    ap.add_argument("--edl", action="store_true", help="2세대 (Qualcomm EDL). 기본은 1/1.5세대 (Rockchip)")
+    ap.add_argument("--loader", default="", help="MaskROM 로더(rk3399_loader_*.bin) / firehose 로더(.elf/.mbn)")
+    ap.add_argument("--userdata", action="store_true", help="userdata도 백업 (느림)")
+    ap.add_argument("--verity-off", action="store_true", help="vbmeta verity 끄기 (부트로더 언락 기기만 효과)")
+    ap.add_argument("--image", default="", help="Armbian 이미지 (.img/.img.xz)")
+    ap.add_argument("--dtb", default="", help="Armbian용 DTB (선택)")
+    ap.add_argument("-y", "--yes", action="store_true", help="확인 질문 생략")
+    o = ap.parse_args(argv)
+    _, fn, confirm = ACTIONS[o.action]
+    if confirm and not o.yes and input(f"{confirm} [y/N] ").strip().lower() != "y":
+        return 1
+    try:
+        fn(o)
+    except Fail as e:
+        print(f"✘ {e}")
+        return 1
+    print("✔ 성공")
+    return 0
+
+
 # ---------- GUI ----------
 
 def gui():
+    import argparse
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext
 
@@ -773,10 +865,12 @@ def gui():
             return
         if confirm and not messagebox.askyesno("확인", confirm):
             return
+        o = argparse.Namespace(edl=gen.get() == "edl", loader=loader.get(), userdata=userdata.get(),
+                               verity_off=verity.get(), image=armbian.get(), dtb=dtb.get())
 
         def job():
             try:
-                fn()
+                fn(o)
                 log("✔ 성공")
             except Fail as e:
                 log(f"✘ {e}")
@@ -797,60 +891,7 @@ def gui():
             worker[0] = None
         root.after(100, poll)
 
-    def do_check():
-        if gen.get() == "edl":
-            edl_check(loader.get())
-        else:
-            check_device(loader.get())
-
-    def do_backup():
-        if gen.get() == "edl":
-            edl_backup(loader.get(), userdata.get())
-        else:
-            check_device(loader.get())
-            backup(userdata.get())
-
-    def do_flash():
-        if gen.get() == "edl":
-            edl_flash(loader.get())
-        else:
-            check_device(loader.get())
-            flash()
-
-    def do_restore():
-        if gen.get() == "edl":
-            edl_restore(loader.get())
-        else:
-            check_device(loader.get())
-            restore()
-
-    def do_armbian():
-        if gen.get() == "edl":
-            raise Fail("Armbian은 1/1.5세대(RK3399)만")
-        check_device(loader.get())
-        armbian_install(armbian.get(), dtb.get())
-
-    def do_patch():
-        patch(verity_off=verity.get())
-
-    def everything():
-        do_backup()
-        do_patch()
-        do_flash()
-
-    actions = [
-        ("장치 확인", do_check, None),
-        ("백업", do_backup, None),
-        ("패치", do_patch, None),
-        ("플래시", do_flash, "패치된 super를 기기에 씁니다. 계속?"),
-        ("복구", do_restore, "백업 이미지로 전부 되돌립니다. 계속?"),
-        ("전체 실행", everything,
-         "백업 -> 패치 -> 플래시 순서로 진행합니다. 계속?"),
-        ("DTB 추출", extract_dtbs, None),
-        ("Armbian 설치", do_armbian,
-         "eMMC 전체를 Armbian으로 덮습니다 (Android 삭제). 백업 확인했나요? 계속?"),
-    ]
-    for text, fn, confirm in actions:
+    for text, fn, confirm in ACTIONS.values():
         b = tk.Button(btns, text=text, command=lambda f=fn, c=confirm: start(f, c))
         b.pack(side="left", padx=2)
         buttons.append(b)
@@ -860,4 +901,7 @@ def gui():
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
     gui()
