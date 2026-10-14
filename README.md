@@ -32,6 +32,12 @@ irm https://raw.githubusercontent.com/HITEYY/TF-Flasher/master/get.ps1 | iex
 `$HOME\TF-Flasher`에 받아서 설치 후 GUI 실행. 다시 실행하면 업데이트+실행 (`backup\`, `tools\` 유지).
 2세대: 먼저 `$env:TF_EDL=1`. 설치 위치 변경: `$env:TF_DIR='D:\TF-Flasher'`.
 
+**장치가 안 잡힐 때 진단** (드라이버 문제인지 케이블/포트 문제인지 판정, 필요하면 Zadig 실행):
+```powershell
+$env:TF_DIAG=1; irm https://raw.githubusercontent.com/HITEYY/TF-Flasher/master/get.ps1 | iex
+```
+받은 폴더에선 `powershell -ExecutionPolicy Bypass -File install.ps1 -Diag`.
+
 **자동 설치** (받은 폴더에서):
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1        # 1/1.5세대

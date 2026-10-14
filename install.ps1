@@ -5,8 +5,9 @@
 #   -Rebuild   tools\rkdeveloptool.exe 있어도 다시 빌드
 #   -SkipZadig Zadig(USB 드라이버) 받기/실행 생략
 #   -NoLaunch  끝나고 TF-Flasher 실행 안 함
+#   -Diag      설치 없이 USB 연결/드라이버 진단만 (한 줄: $env:TF_DIAG=1 후 irm ... | iex)
 # 하는 일: Python 3 / MSYS2 설치(winget) -> rkdeveloptool 빌드 -> tools\ 에 exe+DLL -> (edl) -> Zadig
-param([switch]$Edl, [switch]$Rebuild, [switch]$SkipZadig, [switch]$NoLaunch)
+param([switch]$Edl, [switch]$Rebuild, [switch]$SkipZadig, [switch]$NoLaunch, [switch]$Diag)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -40,6 +41,95 @@ function Msys($script) {
     $env:CHERE_INVOKING = '1'
     & "$msys\usr\bin\bash.exe" -l ($f -replace '\\', '/')
     if ($LASTEXITCODE -ne 0) { throw "MSYS2 작업 실패 (코드 $LASTEXITCODE)" }
+}
+
+function Get-Zadig {
+    $zadig = Join-Path $tools 'zadig.exe'
+    if (-not (Test-Path $zadig)) {
+        $rel = Invoke-RestMethod 'https://api.github.com/repos/pbatard/libwdi/releases/latest'
+        $asset = $rel.assets | Where-Object name -like 'zadig-*.exe' | Select-Object -First 1
+        if (-not $asset) { throw 'Zadig 다운로드 주소 못 찾음. https://zadig.akeo.ie 에서 직접 받으세요.' }
+        Invoke-WebRequest $asset.browser_download_url -OutFile $zadig
+    }
+    $zadig
+}
+
+$ZadigHelp = @'
+Zadig에서:
+  1. Options -> List All Devices 체크
+  2. USB ID 2207 (Rockchip) 또는 05C6 9008 (QUSB__BULK) 장치 선택 (이름이 비어 있을 수 있음)
+  3. 드라이버 WinUSB 선택 -> Install/Replace Driver
+  4. 케이블 뽑았다 다시 꽂고 진단 다시 실행
+  (Loader/MaskROM 모드가 다른 장치로 잡히면 각각 설치)
+'@
+
+# ---------- 진단 ----------
+# 장치 하나 -> (판정, 해결법). Win32_PnPEntity: PNPDeviceID, Name, Service, ConfigManagerErrorCode
+function Diagnose-Device($d) {
+    $id, $svc, $err = $d.PNPDeviceID, "$($d.Service)", [int]$d.ConfigManagerErrorCode
+    if ($id -match 'VID_0000&PID_0002' -or $err -eq 43) {
+        return 'BAD', '장치 설명자 요청 실패 = 신호 문제 (드라이버 아님). USB 2.0 포트/USB 2.0 허브 경유, 짧은 데이터 케이블로 바꾸기'
+    }
+    $kind = if ($id -match 'VID_05C6&PID_9008') { 'EDL(2세대)' } elseif ($id -match 'VID_2207') { 'Rockchip(1/1.5세대)' } else { $null }
+    if (-not $kind) { return 'OTHER', "문제 있는 USB 장치 (코드 $err)" }
+    if ($svc -ieq 'WinUSB') {
+        if ($err -eq 0) { return 'OK', "$kind + WinUSB 정상" }
+        return 'DRIVER', "$kind WinUSB인데 오류 코드 $err. 뽑았다 다시 꽂기, 안 되면 Zadig로 재설치"
+    }
+    if (-not $svc -or $err -eq 28) { return 'DRIVER', "$kind 드라이버 없음 -> Zadig로 WinUSB 설치" }
+    return 'DRIVER', "$kind 가 '$svc' 드라이버로 잡힘 (RKDevTool/Qualcomm 드라이버 등). libusb용 아님 -> Zadig로 WinUSB로 Replace"
+}
+
+function Find-Devices {
+    Get-CimInstance Win32_PnPEntity | Where-Object {
+        $_.PNPDeviceID -match '^USB\\VID_(2207|05C6&PID_9008|0000&PID_0002)' -or
+        ($_.PNPDeviceID -like 'USB\*' -and $_.ConfigManagerErrorCode -eq 43)
+    }
+}
+
+function Run-Diag {
+    Step 'USB 진단'
+    $devs = @(Find-Devices)
+    if (-not $devs) {
+        Write-Host '대상 장치 없음. 지금 기기를 Loader/MaskROM(2세대는 EDL) 모드로 연결하세요. 30초 대기...'
+        foreach ($i in 1..15) {
+            Start-Sleep 2
+            $devs = @(Find-Devices)
+            if ($devs) { break }
+        }
+    }
+    if (-not $devs) {
+        Write-Host @'
+30초 동안 아무 장치도 안 잡힘 = 연결 자체가 안 됨 (드라이버 문제 아님).
+  - 충전 전용 케이블 아닌지 (가장 흔함). 파일 전송 되던 케이블로
+  - 허브/동글 빼고 본체 포트에 직접, 가능하면 USB 2.0 포트
+  - 모드 진입 확인: 화면 꺼지고 LED만 켜져야 함. 안 되면 BOOT-GND 쇼트(MaskROM)
+  - 2세대는 외부 USB-C 아니라 내부 MicroUSB
+'@ -ForegroundColor Yellow
+        return
+    }
+    $needZadig = $false
+    foreach ($d in $devs) {
+        $state, $msg = Diagnose-Device $d
+        $color = @{ OK = 'Green'; DRIVER = 'Yellow' }[$state]
+        if (-not $color) { $color = 'Red' }
+        Write-Host ("[{0}] {1}  ({2}, 드라이버: {3})" -f $state, $d.Name, $d.PNPDeviceID, $(if ($d.Service) { $d.Service } else { '없음' }))
+        Write-Host "  -> $msg" -ForegroundColor $color
+        if ($state -eq 'DRIVER') { $needZadig = $true }
+        if ($state -eq 'OK' -and $d.PNPDeviceID -match 'VID_2207') {
+            $rk = Join-Path $tools 'rkdeveloptool.exe'
+            if (Test-Path $rk) { & $rk ld } else { Write-Host '  tools\rkdeveloptool.exe 없음 -> install.ps1 먼저' }
+        }
+    }
+    if ($needZadig) {
+        Write-Host $ZadigHelp
+        Start-Process (Get-Zadig)
+    }
+}
+
+if ($Diag) {
+    Run-Diag
+    return
 }
 
 # ---------- Python ----------
@@ -110,21 +200,8 @@ if ($Edl) {
 # ---------- Zadig (USB 드라이버) ----------
 if (-not $SkipZadig) {
     Step 'Zadig (USB 드라이버)'
-    $zadig = Join-Path $tools 'zadig.exe'
-    if (-not (Test-Path $zadig)) {
-        $rel = Invoke-RestMethod 'https://api.github.com/repos/pbatard/libwdi/releases/latest'
-        $asset = $rel.assets | Where-Object name -like 'zadig-*.exe' | Select-Object -First 1
-        if (-not $asset) { throw 'Zadig 다운로드 주소 못 찾음. https://zadig.akeo.ie 에서 직접 받으세요.' }
-        Invoke-WebRequest $asset.browser_download_url -OutFile $zadig
-    }
-    Write-Host @'
-기기를 Loader/MaskROM(2세대는 EDL) 모드로 연결한 상태에서:
-  1. Options -> List All Devices 체크
-  2. USB ID 2207 (Rockchip) 또는 05C6 9008 (QUSB__BULK) 장치 선택
-  3. 드라이버 WinUSB 선택 -> Install/Replace Driver
-  (모드마다 장치가 따로 잡히면 각각 설치. RKDevTool 드라이버는 WinUSB로 바뀜)
-'@
-    Start-Process $zadig
+    Write-Host "기기를 Loader/MaskROM(2세대는 EDL) 모드로 연결한 상태에서 $ZadigHelp"
+    Start-Process (Get-Zadig)
 }
 
 Step '완료'

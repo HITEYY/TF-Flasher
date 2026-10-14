@@ -1,6 +1,7 @@
 # TF-Flasher one-line installer (ASCII only: piped through iex, so no BOM / no Korean here)
 #   irm https://raw.githubusercontent.com/HITEYY/TF-Flasher/master/get.ps1 | iex
-# Options via env vars before running:  $env:TF_EDL=1 (gen 2 edl), $env:TF_DIR='D:\TF-Flasher'
+# Options via env vars before running:  $env:TF_EDL=1 (gen 2 edl), $env:TF_DIAG=1 (USB/driver check only),
+#                                       $env:TF_DIR='D:\TF-Flasher'
 # Downloads the repo into $HOME\TF-Flasher (backup/work/tools kept on update), runs install.ps1, launches the GUI.
 & {
     $ErrorActionPreference = 'Stop'
@@ -24,6 +25,7 @@
 
     $opts = @()
     if ($env:TF_EDL) { $opts += '-Edl' }
+    if ($env:TF_DIAG) { $opts += '-Diag' }
     # Run install.ps1 as a file (it has a UTF-8 BOM for Korean text) in the same PowerShell flavor
     & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'install.ps1') @opts
     if ($LASTEXITCODE -ne 0) { Write-Host "install.ps1 failed (exit $LASTEXITCODE)" -ForegroundColor Red }
