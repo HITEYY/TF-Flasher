@@ -79,7 +79,8 @@ def find_debugfs(required=True):
 
 def check_device(loader=None):
     out = rk("ld")
-    m = re.search(r"Mode=(\w+)", out)
+    # rkdeveloptool: 구버전은 "Mode=Loader", 최신(>=1.0)은 "...\tLoader" 형태로 출력
+    m = re.search(r"Mode=(\w+)", out) or re.search(r"\b(Loader|Maskrom)\b", out, re.I)
     if not m:
         raise Fail("Rockusb 장치 없음. 리셋 버튼 누른 채 전원 연결(안되면 BOOT-GND 쇼트)")
     mode = m.group(1)
