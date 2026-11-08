@@ -13,6 +13,7 @@ import shutil
 import struct
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -88,6 +89,13 @@ def check_device(loader=None):
         if not loader:
             raise Fail("MaskROM 모드: 로더 파일(rk3399_loader_*.bin) 선택 필요")
         rk("db", loader)
+        # db 직후 기기는 USB에서 재열거된다. 곧바로 다음 명령(ppt 등)을 보내면
+        # "Did not find any rockusb device"로 실패하므로 인식될 때까지 기다린다.
+        for _ in range(20):
+            time.sleep(0.5)
+            code, out = run(["rkdeveloptool", "ld"])
+            if code == 0 and ("Loader" in out or "Maskrom" in out):
+                break
         log("로더 다운로드 완료")
     return mode
 
